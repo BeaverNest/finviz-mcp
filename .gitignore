@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime artifacts
+*.log
+finviz_mcp_stderr.log
+
+# Local env / secrets (this server needs none, but keep the habit)
+.env
+.env.*
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
