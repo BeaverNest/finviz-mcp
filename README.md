@@ -1,5 +1,12 @@
 # finviz-mcp
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/MCP-stdio-6E56CF.svg)](https://modelcontextprotocol.io)
+[![Tools](https://img.shields.io/badge/tools-14-2ea44f.svg)](#tools-14)
+[![Robots](https://img.shields.io/badge/robots.txt-enforced-critical.svg)](#compliance-model)
+[![API key](https://img.shields.io/badge/API%20key-not%20required-lightgrey.svg)](#install)
+
 Read-only MCP server for [finviz.com](https://finviz.com) US market data, with a hard
 **robots.txt compliance guard** in front of every request.
 
