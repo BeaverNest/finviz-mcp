@@ -40,8 +40,10 @@ CASES = [
     ("news", {"limit": 3}),
     ("insider_trades", {"limit": 3}),
     ("economic_calendar", {"min_importance": 1}),
-    ("screener_signal", {"signal": "topgainers", "limit": 5}),      # diharap MENOLAK (robots)
-    ("custom_screener", {"filters": "idx_sp500", "limit": 5}),      # diharap MENOLAK (robots)
+    ("screener_signal", {"signal": "topgainers", "limit": 5}),      # harus LOLOS (URL allow-list, v=340)
+    ("custom_screener", {"filters": "idx_sp500", "limit": 5}),      # harus MENOLAK (butuh opt-in)
+    ("custom_screener", {"filters": "industry_shellcompanies", "limit": 5,
+                         "allow_noncompliant": True}),              # harus LOLOS dengan opt-in
 ]
 
 
@@ -69,7 +71,9 @@ async def main():
                 elif "headlines" in d:
                     detail = f"headlines={len(d['headlines'])}"
                 elif name == "quote":
-                    detail = f"field={len(d.get('fundamentals', d.get('snapshot', {})) or {})}"
+                    # quote() returns its fundamentals under "metrics" (older key was "snapshot")
+                    metrics = d.get("metrics") or d.get("fundamentals") or d.get("snapshot") or {}
+                    detail = f"metrics={len(metrics)}"
                 elif name == "health":
                     detail = f"reachable={d.get('reachable') or d.get('ok')}"
                 elif name == "robots_policy":
@@ -78,11 +82,16 @@ async def main():
                     lolos += 1
                     print(f"  {name:<20} ok=True  {detail}")
                 elif ok is False:
-                    # penolakan robots adalah perilaku BENAR untuk dua tool screener
+                    # Hanya penolakan custom_screener TANPA opt-in yang benar; sinyal allow-list
+                    # sekarang harus lolos, jadi ok=False di sana adalah regresi.
                     err = str(d.get("error", ""))[:60]
-                    benar = name in ("screener_signal", "custom_screener") and "robots" in err.lower()
+                    benar = (name == "custom_screener" and "robots" in err.lower()
+                             and not args.get("allow_noncompliant"))
                     print(f"  {name:<20} ok=False {err} {'<- memang seharusnya begitu' if benar else '<- PERIKSA'}")
-                    netral += 1
+                    if benar:
+                        netral += 1
+                    else:
+                        gagal += 1
                 else:
                     print(f"  {name:<20} tanpa kunci 'ok': {list(d)[:5]}")
                     netral += 1

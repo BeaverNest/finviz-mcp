@@ -22,12 +22,18 @@ python finviz_cli.py group_performance group=sector
 
 ## Why it exists
 
-The obvious Finviz tool is the screener — and it is the one you cannot use. Every
-`/screener?...` URL redirects to `/screener/stocks?...`, which is `Disallow`ed by finviz's own
-robots.txt, and the allow-listed variants (`v=340`, `v=320`, `v=210`) are JavaScript-rendered:
-the HTML comes back 400 KB and contains **zero table rows**. The only CSV export endpoint is
-disallowed *and* paywalled. So this server refuses screener calls by design and gives you
-per-ticker fundamentals instead, which is what fundamental analysis actually needs.
+The obvious Finviz tool is the screener — and the docs used to say it was unusable. That was
+wrong, and the correction is the most useful thing in this repo. Every `/screener?...` URL
+does redirect to `/screener/stocks?...`, which finviz's own robots.txt `Disallow`s for generic
+clients — so **custom filters still require an explicit opt-in**. But the allow-listed signal
+URLs (`v=340`, `v=320`, `v=210`) work, and the "JavaScript-rendered, zero rows" claim was this
+server's own parsing gap: those pages ship their full result set inside a
+`<script type="application/json">` blob at `data.rows[]`, not as an HTML `<table>`. Reading
+that blob yields typed numbers and every row on the page (`f=industry_shellcompanies` returns
+all 328 shell companies, 20 per page, with `marketCap`/`price` as floats, and `v=121`/`v=161`
+give valuation and balance-sheet fields). Use `screener_signal` for the allow-listed signals
+and `custom_screener` with `allow_noncompliant=True` for arbitrary filters. For fundamentals
+on a list of tickers you already have, `quote_batch` is still cheaper and fully compliant.
 
 ## Tools (14)
 
@@ -45,8 +51,8 @@ per-ticker fundamentals instead, which is what fundamental analysis actually nee
 | `earnings_calendar` | `/api/calendar/earnings` | OK | EPS estimate vs actual, surprise, 1-day price reaction |
 | `dividends_calendar` | `/api/calendar/dividends` | OK | ex-date, ordinary/special, yield |
 | `group_performance` | `/groups.ashx?g=` | OK | 11 sectors / 148 industries: stocks, cap, div, P/E, chg %, volume |
-| `screener_signal` | `/screener?v=111&s=` | **DENIED** | returns a diagnosis, not rows |
-| `custom_screener` | `/screener?v=111&f=` | **DENIED** | returns a diagnosis, not rows |
+| `screener_signal` | `/screener?v=340&s=` | OK | allow-listed signals only; rows via embedded JSON |
+| `custom_screener` | `/screener?v=&f=` | **opt-in** | arbitrary filters; needs `allow_noncompliant=True` |
 
 ### `quote_batch` — the screener replacement
 
@@ -96,14 +102,16 @@ Verified policy map:
 | Path | Verdict |
 |---|---|
 | `/`, `/stock?t=`, `/news?t=`, `/insidertrading`, `/calendar/*`, `/api/calendar/*` | allowed (no matching rule) |
-| `/screener?v=340&s=…`, `v=320`, `v=210` (their ~35-URL allowlist) | allowed but JS-rendered |
-| `/screener?v=111&s=…`, `/screener?v=111&f=…` | **Disallow: /screener?*** |
+| `/screener?v=340&s=…`, `v=320`, `v=210` (their ~35-URL allowlist) | **allowed — and usable** (rows in embedded JSON) |
+| `/screener?v=111&s=…`, `/screener?v=111&f=…`, `/screener/stocks?*` | **Disallow: /screener?*** and `Disallow: /screener/stocks?*` |
 | `/export.ashx`, `/api/v1/screener-export-csv` | **Disallowed** (and paid) |
 
-Screener tools therefore return a refusal with an explanation. They only execute when the
-caller passes `allow_noncompliant=True` explicitly — the response is then flagged
-`robots_compliant: false`. `FINVIZ_ALLOW_NONCOMPLIANT=1` flips the default globally; that is
-your call to make, not this server's.
+`screener_signal` runs **without** any override for the allow-listed signals — an earlier
+version hardcoded `v=111` and so denied itself; if a signal URL is not Allow-listed it still
+refuses. `custom_screener` needs `allow_noncompliant=True` because arbitrary `f=` filters
+302-redirect into `/screener/stocks?*`; the response is then flagged `robots_compliant: false`.
+`FINVIZ_ALLOW_NONCOMPLIANT=1` flips the default globally; that is your call to make, not this
+server's.
 
 ### Three stdlib robots.txt traps this server works around
 

@@ -368,6 +368,64 @@ def _parse_screener_rows(soup: BeautifulSoup, limit: int = 0) -> tuple[list[str]
     return headers, rows
 
 
+def _rows_from_json(html: str, limit: int = 0) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    """Pull screener rows out of the JSON blob finviz embeds in every /screener page.
+
+    Verified 2026-10-29: these views are server-rendered, just not as an HTML table — the rows
+    ship inside ``<script type="application/json">`` at ``data.rows[]``, each row shaped
+    ``{"text": {...}, "numbers": {...}}``. The HTML-only parser therefore reported
+    "JavaScript-rendered, zero rows" for pages carrying the full result set (the first
+    ``f=industry_shellcompanies`` request contained 328 companies in 20 rows). Same payload,
+    better source: ``numbers`` arrives typed (floats), so no re-parsing of formatted strings.
+    """
+    m = re.search(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        return [], [], {}
+    try:
+        blob = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return [], [], {}
+    data = blob.get("data") if isinstance(blob, dict) else None
+    if not isinstance(data, dict):
+        return [], [], {}
+    raw_rows = data.get("rows") or []
+    if not isinstance(raw_rows, list) or not raw_rows:
+        return [], [], {}
+
+    headers: list[str] = []
+    for r in raw_rows:
+        for src in ("text", "numbers"):
+            block = r.get(src) if isinstance(r, dict) else None
+            if isinstance(block, dict):
+                for k in block:
+                    if k not in headers and k != "order":
+                        headers.append(k)
+    rows: list[dict[str, Any]] = []
+    for r in raw_rows:
+        if not isinstance(r, dict):
+            continue
+        item: dict[str, Any] = {}
+        for src in ("text", "numbers"):
+            block = r.get(src)
+            if isinstance(block, dict):
+                for k, v in block.items():
+                    if k == "order":
+                        continue
+                    item[k] = v
+        if not item:
+            continue
+        rows.append(item)
+        if limit and len(rows) >= limit:
+            break
+    meta = {
+        "total_count": data.get("totalCount"),
+        "first_row": data.get("firstRow"),
+        "page_size": data.get("pageSize"),
+        "parsed_from": "embedded_json",
+    }
+    return headers, rows, meta
+
+
 def _parse_kv_tables(soup: BeautifulSoup, must_contain: list[str]) -> list[dict[str, str]]:
     """Generic: for each row of a table whose text mentions any must_contain token."""
     found: list[dict[str, str]] = []
@@ -809,7 +867,7 @@ def screener_signal(
             "error": f"unknown signal {signal!r}",
             "valid_signals": sorted(SIGNAL_TOKENS),
         }, indent=2)
-    params: dict[str, Any] = {"v": "111", "s": token}
+    params: dict[str, Any] = {"v": "340", "s": token}
     if sort.strip():
         params["o"] = sort.strip()
     if page and page > 1:
@@ -818,26 +876,31 @@ def screener_signal(
         res = _get("/screener", params, ttl=45, allow_noncompliant=allow_noncompliant)
     except PermissionError as exc:
         return json.dumps({"ok": False, "error": str(exc), "diagnosis": (
-            "Finviz's screener is not reachable compliantly: every /screener?... URL (including the "
-            "paths robots.txt Allow-lists) 302-redirects to /screener/stocks?..., which robots.txt "
-            "Disallows, and the results table is JavaScript-rendered (a 400KB page contains zero "
-            "ticker rows). The only data endpoint referenced is /api/v1/screener-export-csv, also "
-            "Disallowed (and a paid Finviz feature)."),
+            "This signal's URL is not in finviz's Allow-list. Only the specific /screener?v=... "
+            "signal URLs listed by robots_policy() are permitted; everything else falls under "
+            "Disallow: /screener?*."),
             "use_instead": ["quote_batch (fundamentals for a known list)",
                             "signals_snapshot (homepage movers, server-rendered)",
                             "market_overview", "group_performance (sector/industry table)"]}, indent=2)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
     soup = _soup(res["payload"])
-    headers, rows = _parse_screener_rows(soup, limit=int(limit or 20))
+    # JSON blob FIRST: its fields are typed and its tickers are explicit. The legacy HTML-table
+    # parser stays as a fallback only — verified 2026-10-29 that on v=340&s=n_upgrades it picked
+    # the cell text "Upgrade" as a ticker while the JSON blob held the real 8 rows.
+    headers, rows, meta = _rows_from_json(res["payload"], limit=int(limit or 20))
+    origin = "embedded_json" if rows else "none"
+    if not rows:
+        headers, rows = _parse_screener_rows(soup, limit=int(limit or 20))
+        origin = "html_table" if rows else "none"
     if not rows:
         return _out({
             "ok": False,
-            "error": "no server-rendered rows (this finviz view is JavaScript-rendered)",
-            "hint": "Retry with view v=111 — the default here — or use signals_snapshot().",
+            "error": "no rows in either the embedded JSON blob or the HTML table",
+            "hint": "The page fetched but carried no result set; retry or check the signal name.",
         }, res)
     return _out({"ok": True, "signal": name, "page": page, "headers": headers, "rows": rows,
-                 "row_count": len(rows)}, res)
+                 "row_count": len(rows), "parsed_from": origin}, res, meta)
 
 
 @mcp.tool()
@@ -876,18 +939,25 @@ def custom_screener(
         res = _get("/screener", params, ttl=45, allow_noncompliant=allow_noncompliant)
     except PermissionError as exc:
         return json.dumps({"ok": False, "error": str(exc), "diagnosis": (
-            "Custom screening needs /screener?f=..., which redirects into a robots-disallowed URL "
-            "and is JavaScript-rendered. There is no compliant path to it from this server."),
+            "Custom screening needs /screener?f=..., which robots.txt Disallows for generic "
+            "clients and which 302-redirects into /screener/stocks?* (also Disallowed). The "
+            "redirect is followed and re-checked, so the override is required end-to-end."),
             "use_instead": ["quote_batch (fundamentals for a known ticker list)",
-                            "group_performance (sector/industry valuation context)"]}, indent=2)
+                            "group_performance (sector/industry valuation context)",
+                            "screener_signal (the Allow-listed signal URLs)"]}, indent=2)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
     soup = _soup(res["payload"])
-    headers, rows = _parse_screener_rows(soup, limit=int(limit or 20))
+    headers, rows, meta = _rows_from_json(res["payload"], limit=int(limit or 20))
+    origin = "embedded_json" if rows else "none"
     if not rows:
-        return _out({"ok": False, "error": "no server-rendered rows for this view (JavaScript-rendered)"}, res)
+        headers, rows = _parse_screener_rows(soup, limit=int(limit or 20))
+        origin = "html_table" if rows else "none"
+    if not rows:
+        return _out({"ok": False,
+                     "error": "no rows in either the embedded JSON blob or the HTML table"}, res)
     return _out({"ok": True, "filters": flt, "view": view, "page": page, "headers": headers,
-                 "rows": rows, "row_count": len(rows)}, res)
+                 "rows": rows, "row_count": len(rows), "parsed_from": origin}, res, meta)
 
 
 @mcp.tool()
