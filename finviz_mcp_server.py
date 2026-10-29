@@ -96,9 +96,12 @@ mcp = FastMCP(
         "ticker list — this is the replacement for screening), market_overview (breadth, futures, "
         "rates, headlines, calendar), signals_snapshot (homepage movers), news, insider_trades, "
         "economic_calendar, earnings_calendar, dividends_calendar, group_performance "
-        "(sector/industry performance), robots_policy. NOTE: screener_signal and custom_screener "
-        "do NOT work — finviz redirects /screener?* into a robots-disallowed path and renders "
-        "results in JavaScript; they only return a diagnosis. Every request is re-checked against "
+        "(sector/industry performance), robots_policy. screener_signal works for the "
+        "Allow-listed signal URLs (v=340/v=320/v=210) without any override. custom_screener "
+        "does arbitrary filters but needs allow_noncompliant=True, because those URLs "
+        "302-redirect into /screener/stocks?*, which finviz Disallows for generic clients. "
+        "Both read rows from the page's embedded <script type=\"application/json\"> blob "
+        "(data.rows[]), not from an HTML table. Every request is re-checked against "
         "finviz.com/robots.txt, including the final URL after redirects. Data is delayed external "
         "data: label it 'partially verified' and never present it as investment advice."
     ),
@@ -918,7 +921,9 @@ def custom_screener(
         filters: Finviz filter string, e.g. "idx_sp500,fa_pe_u20,ta_sma200_pa"
                  (index/sector + fundamentals + technicals, comma-separated).
         view: Finviz view id: "111" (Overview), "121" (Valuation), "161" (Financial),
-              "171" (Ownership), "111" default is the only one verified to server-render.
+              "171" (Ownership), "141" (Performance), "311" (Technical). All verified
+              2026-10-29 to yield rows via the embedded JSON blob; v=121 adds P/B, P/C, P/E,
+              P/FCF and v=161 adds current/quick ratio and debt/equity.
         sort: Sort field, e.g. "-marketcap", "-pe", "-change".
         page: 1-based page (20 rows per page).
         limit: Max rows returned.
