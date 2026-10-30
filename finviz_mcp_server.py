@@ -225,6 +225,7 @@ def _get(
     ttl: int | None = None,
     allow_noncompliant: bool = False,
     expect_json: bool = False,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     qs = ("?" + urlencode(params)) if params else ""
     url = BASE + path + qs
@@ -235,7 +236,7 @@ def _get(
     ttl = CACHE_TTL if ttl is None else ttl
     key = url
     hit = _cache.get(key)
-    if hit and (time.time() - hit[0]) < ttl:
+    if hit and not refresh and (time.time() - hit[0]) < ttl:
         payload, age = hit[1], round(time.time() - hit[0], 1)
         return {"payload": payload, "url": url, "cache_age_s": age, "from_cache": True,
                 "robots_compliant": check["allowed"]}
@@ -427,6 +428,40 @@ def _rows_from_json(html: str, limit: int = 0) -> tuple[list[str], list[dict[str
         "parsed_from": "embedded_json",
     }
     return headers, rows, meta
+
+
+# Numeric fields the screener blob returns as raw floats, with the unit finviz uses for each.
+# Verified against quote() on 2026-10-29: screener marketCap 5149206.09 == quote '5149.21B'
+# (i.e. MILLIONS of USD, not dollars), price/prevClose == quote px, volume == quote shares.
+_SCREENER_UNITS = {
+    "marketCap": ("millions_usd", "Free-tier finviz reports market cap in MILLIONS of USD "
+                                 "(5149206.09 == 5.15 trillion). Multiply by 1e6 for dollars."),
+    "price": ("usd_per_share", "Last price in USD."),
+    "prevClose": ("usd_per_share", "Previous close in USD."),
+    "change": ("percent", "Percent change vs previous close."),
+    "volume": ("shares", "Shares traded today."),
+}
+
+
+def _add_units(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Make the screener's raw floats self-describing.
+
+    Without this, `marketCap: 48499.35` reads like USD 48 thousand when it actually means
+    USD 48.5 billion — a 1e6 error that silently survives into a report. We keep the original
+    keys untouched (backward compatible) and add `marketCap_usd` + a `_units` legend.
+    """
+    legend: dict[str, Any] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        mc = row.get("marketCap")
+        if isinstance(mc, (int, float)) and "marketCap_usd" not in row:
+            row["marketCap_usd"] = mc * 1e6
+        for field in _SCREENER_UNITS:
+            if field in row and field not in legend:
+                unit, note = _SCREENER_UNITS[field]
+                legend[field] = {"unit": unit, "note": note}
+    return legend
 
 
 def _parse_kv_tables(soup: BeautifulSoup, must_contain: list[str]) -> list[dict[str, str]]:
@@ -902,8 +937,9 @@ def screener_signal(
             "error": "no rows in either the embedded JSON blob or the HTML table",
             "hint": "The page fetched but carried no result set; retry or check the signal name.",
         }, res)
+    units = _add_units(rows)
     return _out({"ok": True, "signal": name, "page": page, "headers": headers, "rows": rows,
-                 "row_count": len(rows), "parsed_from": origin}, res, meta)
+                 "row_count": len(rows), "parsed_from": origin, "_units": units}, res, meta)
 
 
 @mcp.tool()
@@ -961,8 +997,251 @@ def custom_screener(
     if not rows:
         return _out({"ok": False,
                      "error": "no rows in either the embedded JSON blob or the HTML table"}, res)
+    units = _add_units(rows)
     return _out({"ok": True, "filters": flt, "view": view, "page": page, "headers": headers,
-                 "rows": rows, "row_count": len(rows), "parsed_from": origin}, res, meta)
+                 "rows": rows, "row_count": len(rows), "parsed_from": origin,
+                 "_units": units}, res, meta)
+
+
+@mcp.tool()
+def screener_filters(
+    search: str = "",
+    group: str = "",
+    limit: int = 100,
+    refresh: bool = False,
+) -> str:
+    """Catalogue of valid screener filter values — so nobody has to guess `f=` tokens.
+
+    Every /screener page embeds the whole filter catalogue in the same JSON blob the rows come
+    from: 23 groups and 828 options (exch, idx, sec, industry with 148 entries, geo, cap,
+    fa_*, ta_*, sh_*, theme/subtheme...). Verified 2026-10-29. Previously an agent had to
+    already know that "Shell Companies" means `industry_shellcompanies`.
+
+    Args:
+        search: Case-insensitive substring matched against value AND label
+                (e.g. "shell" finds value `shellcompanies`).
+        group: Restrict to one filter group key (e.g. "industry", "sec", "cap").
+        limit: Max options returned (default 100).
+        refresh: Bypass the cached catalogue.
+
+    Returns:
+        JSON: groups + matching options with their `f=` value and human label.
+    """
+    try:
+        res = _get("/screener", {"v": "121"}, ttl=int(CACHE_TTL or 60), refresh=refresh,
+                   allow_noncompliant=True)
+    except PermissionError as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    m = re.search(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>',
+                  res["payload"], re.S)
+    if not m:
+        return _out({"ok": False, "error": "filter catalogue not found in page"}, res)
+    try:
+        blob = json.loads(m.group(1))
+    except (ValueError, TypeError) as exc:
+        return _out({"ok": False, "error": f"catalogue JSON parse failed: {exc}"}, res)
+    groups = ((blob.get("filters") or {}).get("filters")) or []
+    if not isinstance(groups, list):
+        return _out({"ok": False, "error": "unexpected catalogue shape"}, res)
+
+    needle = (search or "").strip().lower()
+    want_group = (group or "").strip().lower()
+    out: list[dict[str, Any]] = []
+    total_opts = 0
+    for grp in groups:
+        if not isinstance(grp, dict):
+            continue
+        gkey = str(grp.get("key") or "")
+        opts = grp.get("options") or []
+        if not isinstance(opts, list):
+            continue
+        total_opts += len(opts)
+        if want_group and gkey.lower() != want_group:
+            continue
+        title = grp.get("title") or {}
+        kept = []
+        for opt in opts:
+            if not isinstance(opt, dict):
+                continue
+            val = str(opt.get("value") or "")
+            lab = str(opt.get("label") or "")
+            if needle and needle not in val.lower() and needle not in lab.lower():
+                continue
+            kept.append({"value": val, "label": lab})
+        if kept:
+            out.append({"group": gkey, "tab": grp.get("tab"),
+                        "ui_type": grp.get("uiType"),
+                        "title": title.get("full") or title.get("short") or gkey,
+                        "options": kept,
+                        "matched_total": len(kept)})
+        if sum(len(g["options"]) for g in out) >= int(limit or 100):
+            break
+
+    # Apply the row budget across groups (a single group like `industry` has 148 options, so
+    # trimming must happen here, not only at the group boundary).
+    budget = int(limit or 100)
+    trimmed: list[dict[str, Any]] = []
+    used = 0
+    for grp_out in out:
+        if used >= budget:
+            break
+        allow = budget - used
+        opts_kept = grp_out["options"][:allow]
+        used += len(opts_kept)
+        trimmed.append({**grp_out, "options": opts_kept,
+                        "options_truncated": len(opts_kept) < grp_out["matched_total"]})
+    out = trimmed
+
+    n_shown = sum(len(g["options"]) for g in out)
+    return _out({
+        "ok": True,
+        "search": search,
+        "group_filter": group,
+        "groups_total": len(groups),
+        "options_total": total_opts,
+        "groups_shown": len(out),
+        "options_shown": n_shown,
+        "matches": out,
+        "usage": ("Join value with its group prefix to build the f= string: group "
+                  "'industry' + value 'shellcompanies' -> f=industry_shellcompanies. "
+                  "Combine with commas, e.g. f=industry_shellcompanies,cap_large."),
+    }, res)
+
+
+@mcp.tool()
+def screener_all(
+    filters: str,
+    view: str = "121",
+    sort: str = "-marketcap",
+    max_pages: int = 3,
+    dedupe: bool = True,
+) -> str:
+    """Every row for a filter, paginating — but ONLY within an explicit page budget.
+
+    Finviz serves 20 rows per page and has no batch endpoint. Measured 2026-10-29 on
+    `f=industry_shellcompanies`: offsets up to r=981 work, r>=1001 returns HTTP 403, and 17
+    pages yielded exactly 328 unique tickers (== totalCount) in 28.7 s with zero duplicates.
+    So 1000 rows is the hard ceiling and each page is a separate request.
+
+    This is deliberately NOT free-running: default max_pages=3 (60 rows) and the page budget is
+    capped at 50 (1000 rows). Each page also 302-redirects through a robots-Disallowed URL, so
+    this path is non-compliant by construction and every response says so. Ask for a bigger
+    max_pages only when you actually need the whole population — it is real load on their site.
+
+    Args:
+        filters: Finviz filter string (see screener_filters to discover values).
+        view: View id — "121" (valuation) gives P/B,P/C,P/E,P/FCF; "161" balance sheet.
+        sort: Sort field, e.g. "-marketcap", "-price".
+        max_pages: Page budget, 1..50 (20 rows each). Default 3.
+        dedupe: Drop tickers already seen (finviz can repeat rows across pages).
+
+    Returns:
+        JSON: rows, pages_fetched, unique count, total_count, truncation flag, units.
+    """
+    flt = (filters or "").strip()
+    if not flt:
+        return json.dumps({"ok": False, "error": "filters cannot be empty"}, indent=2)
+    pages = int(max_pages or 3)
+    if pages < 1:
+        pages = 1
+    if pages > 50:
+        pages = 50
+
+    all_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    duplicates = 0
+    total_count = None
+    pages_done = 0
+    units: dict[str, Any] = {}
+    stop_reason = ""
+    last_url = ""
+    cache_ages: list[float] = []
+
+    for page in range(1, pages + 1):
+        params: dict[str, Any] = {"v": str(view or "121").strip(), "f": flt}
+        if sort.strip():
+            params["o"] = sort.strip()
+        if page > 1:
+            params["r"] = (page - 1) * 20 + 1
+        try:
+            res = _get("/screener", params, ttl=45, allow_noncompliant=True)
+        except PermissionError as exc:
+            stop_reason = f"robots refused page {page}: {exc}"
+            break
+        except Exception as exc:  # noqa: BLE001
+            stop_reason = f"{type(exc).__name__} on page {page}: {exc}"
+            break
+
+        last_url = res["url"]
+        cache_ages.append(res["cache_age_s"])
+        _, rows, meta = _rows_from_json(res["payload"])
+        page_total = meta.get("total_count")
+        first_row = meta.get("first_row")
+        if total_count is None and page_total is not None:
+            total_count = page_total
+        if not rows:
+            stop_reason = f"page {page} returned no rows"
+            break
+        # Verified 2026-10-29: an offset past the end CLAMPS to the last page instead of
+        # returning empty (r=341/401/981 all returned first_row=320 with the same 8 rows), so
+        # a naive loop spends its whole budget re-reading one page. Stop when the page we got
+        # is not the page we asked for.
+        expected_first = (page - 1) * 20
+        if isinstance(first_row, int) and first_row != expected_first:
+            stop_reason = (f"offset {expected_first} clamped to first_row={first_row} "
+                           f"— end of results reached")
+            break
+        pages_done += 1
+        units = _add_units(rows) or units
+        new_this_page = 0
+        for row in rows:
+            tick = str(row.get("ticker") or "")
+            if dedupe and tick:
+                if tick in seen:
+                    duplicates += 1
+                    continue
+                seen.add(tick)
+            all_rows.append(row)
+            new_this_page += 1
+        if pages_done >= 1 and total_count and len(all_rows) >= total_count:
+            stop_reason = "collected total_count rows"
+            break
+        if new_this_page == 0:
+            stop_reason = f"page {page} produced no new tickers"
+            break
+
+    truncated = bool(total_count and len(all_rows) < total_count)
+    return json.dumps({
+        "ok": bool(all_rows),
+        "filters": flt,
+        "view": view,
+        "sort": sort,
+        "rows": all_rows,
+        "row_count": len(all_rows),
+        "unique_tickers": len(seen) if dedupe else None,
+        "duplicates_dropped": duplicates,
+        "pages_fetched": pages_done,
+        "max_pages": pages,
+        "page_size": 20,
+        "total_count": total_count,
+        "truncated": truncated,
+        "stopped_because": stop_reason or ("page budget reached" if truncated else ""),
+        "cost_note": (f"{pages_done} sequential requests, each through a robots-Disallowed "
+                      f"redirect. Free tier, delayed data — partially verified."),
+        "_units": units,
+        "_meta": {
+            "source_url": last_url,
+            "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "robots_compliant": False,
+            "robots_note": ("Deliberate: /screener?f=... 302-redirects into "
+                            "/screener/stocks?*, which finviz Disallows for generic clients."),
+            "cache_age_s": cache_ages,
+            "data_quality": "partially verified (external, free tier, delayed)",
+            "disclaimer": DISCLAIMER,
+        },
+    }, ensure_ascii=False, indent=2, default=str)
 
 
 @mcp.tool()
