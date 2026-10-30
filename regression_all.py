@@ -62,6 +62,13 @@ CASES = [
     ("earnings_calendar", {}),
     ("dividends_calendar", {}),
     ("group_performance", {"kind": "sector"}),
+    # --- earnings_history (2026-10-30): the ty=ea payload lives in an embedded JSON blob.
+    # A DOM parser returns nothing here, so "the page loaded" is not evidence for this tool.
+    ("earnings_history", {"ticker": "AAPL", "limit": 4}),
+    ("earnings_history", {"ticker": "NVDA", "view": "annual", "limit": 3}),
+    ("earnings_history", {"ticker": "AAPL", "view": "revisions", "limit": 3}),
+    ("earnings_history", {"ticker": "AAPL", "view": "bogus"}),          # harus MENOLAK
+    ("earnings_history", {"ticker": "../../etc/passwd"}),              # harus MENOLAK
 ]
 
 
@@ -75,11 +82,42 @@ def expects_reject(name: str, args: dict) -> str:
         tx = str(args.get("transaction", "")).strip().lower()
         if tx and tx not in ("all", "buy", "sale", "option"):
             return "unknown transaction"
+    if name == "earnings_history":
+        v = str(args.get("view", "quarterly")).strip().lower()
+        if v not in ("quarterly", "annual", "revisions", "all"):
+            return "invalid view"
+        if not args.get("ticker", "").replace(".", "").replace("-", "").isalnum():
+            return "invalid ticker"
     return ""
 
 
 def invariant_failure(name: str, args: dict, d: dict) -> str:
     """Kontrak yang harus dipegang hasil, bukan cuma ok=True. Kembalikan pesan bila dilanggar."""
+    if name == "earnings_history":
+        if d.get("ok") is not True:
+            return ""
+        view = args.get("view", "quarterly")
+        rows = (d.get("quarterly") or []) + (d.get("annual") or [])
+        if not rows and view != "revisions":
+            return "no quarterly/annual rows"
+        if view in ("quarterly", "annual") and len(rows) == 0:
+            return f"view={view} returned nothing"
+        if len(rows) > int(args.get("limit") or 12):
+            return "limit not honoured"
+        for r in rows:
+            if r.get("eps_actual") is not None and r.get("eps_estimate") is not None:
+                # derive it independently: a fabricated surprise shows up as a mismatch here
+                want = round(100 * (r["eps_actual"] - r["eps_estimate"]) / abs(r["eps_estimate"]), 2)
+                if r.get("eps_surprise_pct") != want:
+                    return (f"eps_surprise_pct {r.get('eps_surprise_pct')} != recomputed {want} "
+                            f"({r.get('fiscal_period')}) — pair mixing")
+            if r.get("eps_basis_conflict") and r.get("eps_basis_divergence_pp") is None:
+                return "conflict set without divergence value"
+            if r.get("is_estimate") and r.get("eps_actual") is not None:
+                return "is_estimate=true but an actual is present"
+        if "next_earnings_date" not in d:
+            return "next_earnings_date missing"
+        return ""
     if name != "insider_trades" or d.get("ok") is not True:
         return ""
     rows = d.get("rows") or []

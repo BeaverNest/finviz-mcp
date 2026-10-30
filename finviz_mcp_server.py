@@ -304,7 +304,123 @@ def _out(obj: dict[str, Any], res: dict[str, Any] | None = None, extra: dict[str
     return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
 
 
-# ----------------------------------------------------------------------- parsers
+# ------------------------------------------------------- route-init-data (embedded JSON)
+#
+# The /stock page carries its real content in `<script id="route-init-data" type="application/json">`,
+# NOT in HTML tables. Verified 2026-10-30 on /stock?t=AAPL&p=d&ty=ea: the page has zero cells
+# containing the words "Surprise"/"Estimate", yet the blob holds 116 quarters of
+# actual-vs-estimate EPS and sales. Any parser that reads the DOM for this page returns nothing,
+# which is how a server can "support" a page and still miss its entire payload.
+#
+# The page is only rendered with a `ty=` view parameter. Without one it has no blob at all, so a
+# tool that forgets `ty` gets a plausible page and an empty parse — raise, do not return empty.
+
+_ROUTE_INIT_RE = re.compile(
+    r'<script id="route-init-data" type="application/json">(.*?)</script>', re.S)
+
+
+def _route_init(html: str) -> dict[str, Any]:
+    m = _ROUTE_INIT_RE.search(html or "")
+    if not m:
+        raise ValueError(
+            "no <script id='route-init-data'> blob — page likely fetched without a ty= view "
+            "parameter; the DOM carries no earnings content")
+    return json.loads(m.group(1))
+
+
+def _num_or_none(v: Any) -> float | None:
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "").replace("%", "")
+    if s in ("", "-", "—", "N/A", "nan", "None"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _pct(a: float | None, b: float | None) -> float | None:
+    """Percent difference of a vs b, guarding division by zero and sign flips."""
+    if a is None or b is None or b == 0:
+        return None
+    return round(100.0 * (a - b) / abs(b), 2)
+
+
+def _earnings_period_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalise earningsData / earningsAnnualData and derive surprises ourselves.
+
+    Finviz ships TWO EPS pairs on every row and they are NOT the same series on different
+    precision — they are different accounting bases, with different analyst counts:
+
+        epsActual / epsEstimate          n=42    (NVDA 2026Q2: 2.2239 / 2.0936  -> +6.22%)
+        epsReportedActual / epsReportedEstimate  n=25    (NVDA 2026Q2: 2.46 / 2.1105 -> +16.56%)
+
+    On AAPL the two agree to ~0.001, so a parser that mixes them looks perfect. On NVDA the
+    same code reports +16.56% for a quarter whose headline beat was +6.22%. Mixing the numerator
+    of one pair with the denominator of the other fabricates a surprise out of two bases.
+
+    Rule: never mix pairs. Emit both, labelled, and flag material divergence instead of
+    silently preferring one. `eps_surprise_pct` stays on the primary (unreported) pair because
+    that is the consensus series with the larger analyst base.
+    """
+    out: list[dict[str, Any]] = []
+    for r in rows or []:
+        eps_a = _num_or_none(r.get("epsActual"))
+        eps_e = _num_or_none(r.get("epsEstimate"))
+        eps_ar = _num_or_none(r.get("epsReportedActual"))
+        eps_er = _num_or_none(r.get("epsReportedEstimate"))
+        sal_a = _num_or_none(r.get("salesActual"))
+        sal_e = _num_or_none(r.get("salesEstimate"))
+
+        sur_main = _pct(eps_a, eps_e)
+        sur_rep = _pct(eps_ar, eps_er)
+        divergence = (round(abs(sur_main - sur_rep), 2)
+                      if sur_main is not None and sur_rep is not None else None)
+        out.append({
+            "fiscal_period": r.get("fiscalPeriod"),
+            "fiscal_end": (r.get("fiscalEndDate") or "")[:10] or None,
+            "earnings_date": (r.get("earningsDate") or "")[:19] or None,
+            "is_estimate": eps_a is None and sal_a is None,
+            # primary pair — consensus with the wider analyst base
+            "eps_actual": eps_a,
+            "eps_estimate": eps_e,
+            "eps_surprise_pct": sur_main,
+            # second pair — separate basis, its own analyst count
+            "eps_reported_actual": eps_ar,
+            "eps_reported_estimate": eps_er,
+            "eps_reported_surprise_pct": sur_rep,
+            # how far the two bases disagree; large values mean the row cannot be quoted
+            # with a single "surprise" figure at all
+            "eps_basis_divergence_pp": divergence,
+            "eps_basis_conflict": bool(divergence is not None and divergence >= 2.0),
+            "sales_actual_musd": sal_a,
+            "sales_estimate_musd": sal_e,
+            "sales_surprise_pct": _pct(sal_a, sal_e),
+            "eps_analysts": r.get("epsAnalysts"),
+            "eps_reported_analysts": r.get("epsReportedAnalysts"),
+            "sales_analysts": r.get("salesAnalysts"),
+        })
+    return out
+
+
+def _parse_earnings(html: str) -> dict[str, Any]:
+    blob = _route_init(html)
+    quarterly = _earnings_period_rows(blob.get("earningsData") or [])
+    annual = _earnings_period_rows(blob.get("earningsAnnualData") or [])
+    revisions = blob.get("earningsRevisionsData") or []
+    reactions = blob.get("priceReactionData") or []
+    return {
+        "next_earnings_date": (blob.get("earningsDate") or "")[:19] or None,
+        "quarterly": quarterly,
+        "annual": annual,
+        "revisions": revisions,
+        "price_reaction": reactions,
+        "counts": {"quarterly": len(quarterly), "annual": len(annual),
+                   "revisions": len(revisions), "price_reaction": len(reactions)},
+    }
 
 
 def _parse_snapshot(soup: BeautifulSoup) -> dict[str, str]:
@@ -616,6 +732,69 @@ def robots_policy(path: str = "") -> str:
             "disallowed. Screener tools therefore require allow_noncompliant=True."
         ),
     }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def earnings_history(
+    ticker: str,
+    view: str = "quarterly",
+    reported_only: bool = False,
+    limit: int = 12,
+) -> str:
+    """Actual-vs-estimate EPS and sales history for one US ticker (finviz /stock?ty=ea).
+
+    This is the earnings page (`ty=ea`), whose payload lives in an embedded JSON blob rather
+    than in HTML — the DOM holds no "Surprise"/"Estimate" cells at all, so a DOM parser returns
+    empty while the data is right there.
+
+    Args:
+        ticker: US ticker symbol, e.g. "AAPL".
+        view: "quarterly" (default), "annual", "revisions", or "all".
+        reported_only: Drop rows where no actual was published yet (future estimates).
+            Default False, because an upcoming consensus is the useful part of this page.
+        limit: Max rows returned per series, newest first. Default 12, use 0 for all.
+
+    Returns:
+        JSON: next earnings date, per-period actual/estimate, derived surprise percentages,
+        and provenance. Sales are in MILLIONS of USD.
+    """
+    sym = (ticker or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9\.\-]{1,10}", sym):
+        return json.dumps({"ok": False, "error": f"invalid ticker: {ticker!r}"}, indent=2)
+    want = (view or "quarterly").strip().lower()
+    if want not in ("quarterly", "annual", "revisions", "all"):
+        return json.dumps({"ok": False, "error": f"invalid view: {view!r}"}, indent=2)
+    try:
+        # `ty=ea` is mandatory: without a ty= parameter the page has no route-init-data blob.
+        res = _get("/stock", {"t": sym, "p": "d", "ty": "ea"}, ttl=300)
+        parsed = _parse_earnings(res["payload"])
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
+
+    def _trim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if reported_only:
+            rows = [r for r in rows if not r["is_estimate"]]
+        return rows[:limit] if limit and limit > 0 else rows
+
+    body: dict[str, Any] = {"ok": True, "ticker": sym, "view": want,
+                            "next_earnings_date": parsed["next_earnings_date"],
+                            "counts_available": parsed["counts"],
+                            "_units": {"sales": "millions USD", "surprise": "percent vs estimate",
+                                       "is_estimate": "true = no actual published yet"}}
+    if want in ("quarterly", "all"):
+        body["quarterly"] = _trim(parsed["quarterly"])
+    if want in ("annual", "all"):
+        body["annual"] = _trim(parsed["annual"])
+    if want in ("revisions", "all"):
+        rev = parsed["revisions"]
+        body["revisions"] = rev[-limit:] if limit and limit > 0 else rev
+        body["revisions_note"] = ("estimateType E = EPS, S = sales; one row per revision "
+                                  "snapshot date, newest last")
+    if want == "all":
+        body["price_reaction"] = parsed["price_reaction"]
+    if not any(k in body for k in ("quarterly", "annual", "revisions", "price_reaction")):
+        return json.dumps({"ok": False, "error": "no series returned", "_meta": _meta(res)}, indent=2)
+    return _out(body, res)
 
 
 @mcp.tool()

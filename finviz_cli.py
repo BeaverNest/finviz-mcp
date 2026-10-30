@@ -19,6 +19,8 @@ Usage:
   python3 finviz_cli.py robots_policy
   python3 finviz_cli.py screener_signal signal=topgainers allow_noncompliant=true
   python3 finviz_cli.py custom_screener filters=idx_sp500,fa_pe_u20 allow_noncompliant=true
+  python3 finviz_cli.py earnings_history ticker=AAPL limit=8
+  python3 finviz_cli.py earnings_history ticker=NVDA view=annual limit=5
 
 Read-only, throttled and cached server-side. Finviz data is external free-tier
 (delayed, US markets) — educational/analytical use, never investment advice.
