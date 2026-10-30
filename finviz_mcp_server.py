@@ -660,11 +660,15 @@ def quote(ticker: str, metrics: list[str] | None = None) -> str:
 
 # Preset keyword-groups for quote_batch. Matching is by LABEL KEYWORD, not exact string, so a
 # small label drift on Finviz does not silently empty a column.
+# "Market Cap" was missing from `valuation` until 2026-10-29 — the keyword list had no term that
+# matched it, so a size comparison silently lacked size. Size belongs in a valuation preset.
 _FUNDA_PRESETS = {
-    "valuation": ("P/E", "P/S", "P/B", "P/C", "P/FCF", "PEG", "EV/", "Price/"),
+    "valuation": ("P/E", "P/S", "P/B", "P/C", "P/FCF", "PEG", "EV/", "Price/", "Market Cap"),
     "profitability": ("EPS", "ROE", "ROA", "ROI", "Margin", "Sales"),
     "growth": ("Growth", "EPS this Y", "EPS next Y", "EPS next 5Y", "EPS Q/Q", "Sales Q/Q"),
     "balance": ("Debt", "Current Ratio", "Quick Ratio", "Book/sh", "Cash/sh"),
+    # Price levels and analyst targets: the answer to "what is it trading at vs targets".
+    "price": ("Price", "Prev Close", "Target Price", "Market Cap"),
 }
 
 
@@ -677,14 +681,15 @@ def quote_batch(
 ) -> str:
     """Fundamentals comparison for a KNOWN ticker list (1 request per ticker, >=1s apart).
 
-    Why this exists: the Finviz screener page is not usable from here (see screener_signal —
-    the URL redirects into a robots-disallowed path and the table is JavaScript-rendered), so
-    discovery is out. Per-ticker snapshots are fine, and a comparison table is what fundamental
-    analysis actually needs: give a watchlist, get valuation/profitability/growth/balance columns.
+    Why this exists: it is fully robots-compliant (one /stock?t= request per ticker, >=1s
+    apart) and returns exactly the fundamentals a comparison needs. Use it when you already
+    have the ticker list; use screener_signal / custom_screener / screener_all when you need
+    discovery instead.
 
     Args:
         tickers: 1..40 US tickers, e.g. ["AAPL", "MSFT", "JPM"].
-        preset: "valuation" | "profitability" | "growth" | "balance" | "all".
+        preset: "valuation" (incl. Market Cap) | "profitability" | "growth" | "balance" |
+                "price" (Price, Prev Close, Target Price, Market Cap) | "all".
         extra_metrics: Extra exact metric labels to add (e.g. ["RSI (14)", "Target Price"]).
         include_header: Also return sector/industry/country per ticker.
 
