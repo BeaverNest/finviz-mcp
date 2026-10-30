@@ -35,7 +35,7 @@ give valuation and balance-sheet fields). Use `screener_signal` for the allow-li
 and `custom_screener` with `allow_noncompliant=True` for arbitrary filters. For fundamentals
 on a list of tickers you already have, `quote_batch` is still cheaper and fully compliant.
 
-## Tools (14)
+## Tools (16)
 
 | Tool | Source | Robots | Notes |
 |---|---|---|---|
@@ -52,7 +52,23 @@ on a list of tickers you already have, `quote_batch` is still cheaper and fully 
 | `dividends_calendar` | `/api/calendar/dividends` | OK | ex-date, ordinary/special, yield |
 | `group_performance` | `/groups.ashx?g=` | OK | 11 sectors / 148 industries: stocks, cap, div, P/E, chg %, volume |
 | `screener_signal` | `/screener?v=340&s=` | OK | allow-listed signals only; rows via embedded JSON |
-| `custom_screener` | `/screener?v=&f=` | **opt-in** | arbitrary filters; needs `allow_noncompliant=True` |
+| `custom_screener` | `/screener?v=&f=` | **opt-in** | arbitrary filters, one page; needs `allow_noncompliant=True` |
+| `screener_filters` | `/screener` | **opt-in** | catalogue of 23 groups / 828 valid `f=` values, searchable |
+| `screener_all` | `/screener` | **opt-in** | paginated fetch, `max_pages` budget (default 3, cap 50) |
+
+### Reading screener rows without a 1e6 error
+
+Free-tier finviz reports `marketCap` in **millions of USD** — the raw float is
+`48499.35` for a $48.5B company. Both screener tools therefore also emit
+`marketCap_usd` and a `_units` legend (`marketCap`, `price`, `prevClose`, `change`,
+`volume`), while leaving the original keys untouched. Measured against `quote()`:
+screener `5149206.09` == quote `5149.21B`.
+
+`screener_all` stops on its own rather than trusting the page count: offsets past the
+end **clamp** to the last page (`r=341/401/981` all return `first_row=320` with the
+same 8 rows) and `r>=1001` is HTTP 403, so a naive loop would spend its entire budget
+re-reading one page. Verified full pull: `f=industry_shellcompanies` → 17 pages, 328
+unique tickers (== `totalCount`), 0 duplicates, 28.7 s.
 
 ### `quote_batch` — the screener replacement
 
