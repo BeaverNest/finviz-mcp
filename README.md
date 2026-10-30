@@ -46,7 +46,7 @@ on a list of tickers you already have, `quote_batch` is still cheaper and fully 
 | `signals_snapshot` | `/` | OK | 13–14 homepage mover blocks (gainers, new high, overbought, …) |
 | `market_overview` | `/` | OK | breadth, futures, forex/rates/crypto, headlines, calendar |
 | `news` | `/news?t=` | OK | headlines + source + url |
-| `insider_trades` | `/insidertrading` | OK | latest Form-4 style rows |
+| `insider_trades` | `/insidertrading` | OK | Form-4 rows; server-side filters (ticker, txn, min value, 10% owner), newest-first, explicit coverage block |
 | `economic_calendar` | `/api/calendar/economic` | OK | JSON, actual/forecast/previous, windowed |
 | `earnings_calendar` | `/api/calendar/earnings` | OK | EPS estimate vs actual, surprise, 1-day price reaction |
 | `dividends_calendar` | `/api/calendar/dividends` | OK | ex-date, ordinary/special, yield |
@@ -84,6 +84,36 @@ at the default 1 s rate limit, 10 columns returned.
 
 `quote_batch` does not discover tickers. If you do not already know the list, this server
 cannot help you, and any tool here that pretends otherwise is lying.
+
+### Insider trades — filter server-side or lose rows
+
+`insider_trades` used to filter client-side over whatever the default page held, and that
+produced silently wrong answers: `ticker="NVDA"` returned **0 rows** (NVDA simply was not in
+the 200-row global page) while `ticker="AAPL"` returned 1 of a real 200. The fix pushes every
+filter into finviz's own query params — `t` (ticker), `tc` (transaction type), `tv` (min value),
+`or` (owner type), `o` (sort).
+
+Query-param semantics, all verified on 2026-10-30:
+
+| Param | Values | Note |
+|---|---|---|
+| `t` | one ticker | comma list → **0 rows**; dots must be dashes (`BRK.B` → `BRK-B`); unknown symbol → 0-row page, not 404 |
+| `tc` | 1=buy, 2=sale, 3=buy+sale, 4=option, 5=buy+option, 6=sale+option, 7=all | `tc=2` still contains `Proposed Sale` rows, so `transaction="sale"` is re-checked per row |
+| `tv` | integer USD | combines with `t`; verified no row below the floor |
+| `or` | 10 = 10% owners only, -10 = everyone except them | 10% owners are rare per-ticker, so `t`+`or=10` can legitimately return 0 |
+| `o` | `±transactiondate`, `±transactionValue`, `±ticker`, `±owner`, `±shares`, `±transactionpricepershare` | default finviz order is NOT newest-first; `-transactiondate` is, and stays monotonic |
+
+**Coverage ceiling.** The page is one table of at most **200 rows** and ignores pagination —
+`p=1`, `p=2`, `p=3` and `r=201` all return the identical 200 rows (byte-identical hash). So
+only the newest ~200 *matching* rows exist. The tool reports this instead of hiding it:
+`coverage.page_rows_total`, `rows_matching_filters`, `truncated_by_limit`, `page_is_full`, and
+`window.{newest,oldest_on_page}`. Sorting by value reaches far older rows (`t=NVDA&o=-transactionValue`
+spans 2017→2026) than sorting by date (2025→2026) — the 200-row cut is by sort order, so a
+"latest transactions" query genuinely only sees recent history for busy tickers.
+
+An empty result for a ticker now distinguishes the two causes: the tool probes `/stock?t=`
+and reports `coverage.ticker_exists` — a typo returns `ticker_exists: false`, a real ticker with
+no matching rows returns `true`.
 
 ### Calendar pagination
 

@@ -1283,48 +1283,199 @@ def news(ticker: str = "", limit: int = 25) -> str:
                  "count": len(items)}, res)
 
 
-@mcp.tool()
-def insider_trades(ticker: str = "", transaction: str = "", limit: int = 50) -> str:
-    """Latest insider transactions from the Finviz insider page.
+INSIDER_TC = {"all": "7", "buy": "1", "sale": "2", "option": "4"}
+INSIDER_PAGE_MAX = 200          # finviz serves a single 200-row table; no pagination (verified)
+INSIDER_SORT_KEYS = {
+    "date": "transactiondate", "ticker": "ticker", "owner": "owner",
+    "value": "transactionValue", "shares": "shares", "cost": "transactionpricepershare",
+}
 
-    Args:
-        ticker: Optional ticker filter applied client-side over the latest rows.
-        transaction: Optional filter, e.g. "buy" or "sale".
-        limit: Max rows returned.
 
-    Returns:
-        JSON rows: ticker, owner, relationship, date, transaction, cost, shares, value.
-    """
+def _num(cell: str) -> float | None:
+    raw = (cell or "").replace(",", "").replace("$", "").strip()
     try:
-        res = _get("/insidertrading", None, ttl=120)
-    except Exception as exc:  # noqa: BLE001
-        return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
-    soup = _soup(res["payload"])
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _insider_rows(soup: BeautifulSoup) -> tuple[list[str], list[dict[str, Any]]]:
+    """Parse the insider page table. Returns (headers, rows).
+
+    The row layout is 10 cells: Ticker | Owner | Relationship | Date | Transaction | Cost |
+    #Shares | Value ($) | #Shares Total | SEC Form 4 (link). The ticker cell also carries
+    ``data-boxover-ticker`` and the price cells carry ``data-boxover-value``; prefer those
+    attributes over cell text, which is prefixed with the logo letter (``N NTRA``).
+    """
     tables = soup.find_all("table")
     if not tables:
-        return _out({"ok": False, "error": "no tables found"}, res)
+        return [], []
     best = max(tables, key=lambda t: len(t.find_all("tr")))
     headers = [_txt(c) for c in best.find_all("th")]
-    rows: list[dict[str, str]] = []
-    want_t = ticker.strip().upper()
-    want_tx = transaction.strip().lower()
+    rows: list[dict[str, Any]] = []
     for tr in best.find_all("tr"):
-        cells = [_txt(td) for td in tr.find_all("td")]
-        if len(cells) < 8 or cells[0].lower().startswith("ticker"):
+        cells = tr.find_all("td")
+        if len(cells) < 8:
             continue
-        if want_t and cells[0].split()[-1].upper() != want_t:
+        texts = [_txt(c) for c in cells]
+        if texts[0].lower().startswith("ticker"):
             continue
-        if want_tx and want_tx not in cells[4].lower():
-            continue
+        ticker = (cells[0].get("data-boxover-ticker") or texts[0].split()[-1]).upper()
+        sec = ""
+        if len(cells) >= 10:
+            a = cells[9].find("a", href=True)
+            sec = a["href"] if a else ""
         rows.append({
-            "ticker": cells[0].split()[-1], "owner": cells[1], "relationship": cells[2],
-            "date": cells[3], "transaction": cells[4], "cost": cells[5], "shares": cells[6],
-            "value_usd": cells[7],
+            "ticker": ticker,
+            "owner": texts[1],
+            "relationship": texts[2],
+            "date": texts[3],
+            "transaction": texts[4],
+            "cost": texts[5],
+            "shares": texts[6],
+            "value_usd": texts[7],
+            "value_usd_num": _num(texts[7]),
+            "shares_total": texts[8] if len(texts) > 8 else "",
+            "sec_form4_url": sec,
         })
-        if len(rows) >= max(1, int(limit)):
-            break
-    return _out({"ok": True, "headers": headers, "rows": rows, "row_count": len(rows),
-                 "filters": {"ticker": want_t or None, "transaction": want_tx or None}}, res)
+    return headers, rows
+
+
+@mcp.tool()
+def insider_trades(
+    ticker: str = "",
+    transaction: str = "",
+    limit: int = 50,
+    min_value: int = 0,
+    owner_type: str = "",
+    sort: str = "",
+    newest_first: bool = True,
+) -> str:
+    """Latest insider transactions from the Finviz insider page (/insidertrading).
+
+    Filtering happens SERVER-SIDE (``t``, ``tc``, ``tv``, ``or``, ``o`` params), not
+    client-side after the fact. That distinction is load-bearing: the page holds at most
+    200 rows of one global feed, so filtering a pre-cut page misses most matches. Measured
+    before the fix: ``ticker="NVDA"`` client-side returned 0 rows while the server-side
+    filtered page held 200.
+
+    Coverage limit (honest, not a bug): finviz serves a single table and ignores ``p``/``r``
+    (verified — ``p=2``/``r=201`` return the identical page), so only the most recent ~200
+    MATCHING rows exist at all. Older history is unreachable through this endpoint.
+
+    Args:
+        ticker: US ticker, e.g. "NVDA" (dots normalised to dashes: "BRK.B" → "BRK-B").
+        transaction: "all" (default), "buy", "sale", or "option".
+        limit: Max rows returned (page cap 200).
+        min_value: Minimum transaction value in USD (server-side).
+        owner_type: "10%_owner" for 10% owners only, "officer_director" to exclude them.
+        sort: "date" | "ticker" | "owner" | "value" | "shares" | "cost".
+        newest_first: With sort="date" (default), newest rows first.
+
+    Returns:
+        JSON: headers, rows, row_count, coverage (page size, truncation, ticker status).
+    """
+    params: dict[str, Any] = {}
+
+    wanted = ticker.strip().upper().replace(".", "-")
+    if wanted:
+        if "," in wanted:
+            return json.dumps({
+                "ok": False,
+                "error": ("one ticker per call — finviz /insidertrading?t= accepts a single "
+                          "ticker (a comma list returns 0 rows). Call once per ticker."),
+            }, indent=2)
+        params["t"] = wanted
+
+    tx_key = transaction.strip().lower()
+    if tx_key and tx_key not in INSIDER_TC:
+        return json.dumps({
+            "ok": False,
+            "error": f"unknown transaction '{transaction}' — use {sorted(INSIDER_TC)}",
+        }, indent=2)
+    params["tc"] = INSIDER_TC[tx_key] if tx_key else INSIDER_TC["all"]
+
+    if int(min_value or 0) > 0:
+        params["tv"] = str(int(min_value))
+
+    owner_key = owner_type.strip().lower().replace(" ", "").replace("_", "").replace("%", "")
+    if owner_key:
+        if owner_key in ("10owner", "10"):
+            params["or"] = "10"
+        elif owner_key in ("officerdirector", "not10owner", "exclude10"):
+            params["or"] = "-10"
+        else:
+            return json.dumps({
+                "ok": False,
+                "error": f"unknown owner_type '{owner_type}' — use '10%_owner' or 'officer_director'",
+            }, indent=2)
+
+    sort_key = sort.strip().lower()
+    if sort_key:
+        if sort_key not in INSIDER_SORT_KEYS:
+            return json.dumps({
+                "ok": False,
+                "error": f"unknown sort '{sort}' — use {sorted(INSIDER_SORT_KEYS)}",
+            }, indent=2)
+        params["o"] = INSIDER_SORT_KEYS[sort_key] if not newest_first else "-" + INSIDER_SORT_KEYS[sort_key]
+    elif newest_first:
+        params["o"] = "-transactiondate"   # deterministic newest-first, not finviz's default order
+
+    try:
+        res = _get("/insidertrading", params, ttl=120)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
+
+    headers, rows = _insider_rows(_soup(res["payload"]))
+    page_rows = len(rows)
+
+    # Belt-and-braces on top of the server-side filter: finviz's tc=2 page still contains
+    # "Proposed Sale" rows, so a requested "sale" is re-checked on the row text.
+    if tx_key == "sale":
+        rows = [r for r in rows if "sale" in r["transaction"].lower()]
+    elif tx_key == "buy":
+        rows = [r for r in rows if "buy" in r["transaction"].lower()]
+    if wanted:
+        rows = [r for r in rows if r["ticker"] == wanted]
+
+    limit = max(1, min(int(limit or 50), INSIDER_PAGE_MAX))
+    returned = rows[:limit]
+
+    coverage: dict[str, Any] = {
+        "page_rows_total": page_rows,
+        "rows_matching_filters": len(rows),
+        "rows_returned": len(returned),
+        "truncated_by_limit": len(rows) > len(returned),
+        "page_capacity": INSIDER_PAGE_MAX,
+        "page_is_full": page_rows >= INSIDER_PAGE_MAX,
+        "note": (f"finviz /insidertrading is a single table of at most {INSIDER_PAGE_MAX} rows and "
+                 f"ignores p/r pagination, so only the newest matching rows exist here; the "
+                 f"period covered is whatever those rows span, not a fixed window."),
+    }
+    if page_rows >= INSIDER_PAGE_MAX:
+        coverage["window"] = {
+            "newest": returned[0]["date"] if returned else None,
+            "oldest_on_page": rows[-1]["date"] if rows else None,
+        }
+
+    if not returned and wanted:
+        # An unknown ticker and a real ticker with no insider activity both produce an empty
+        # table. Separate them with the quote page (404 = not a finviz ticker) instead of
+        # reporting "no transactions" for a typo.
+        try:
+            _get("/stock", {"t": wanted}, ttl=300)
+            coverage["ticker_exists"] = True
+            coverage["interpretation"] = "ticker exists, but no rows match the filters given"
+        except Exception:  # noqa: BLE001
+            coverage["ticker_exists"] = False
+            coverage["interpretation"] = "ticker not found on finviz — check the symbol"
+
+    return _out({"ok": True, "headers": headers, "rows": returned, "row_count": len(returned),
+                 "filters": {"ticker": wanted or None, "transaction": tx_key or "all",
+                             "min_value": int(min_value or 0) or None,
+                             "owner_type": owner_type or None, "sort": sort_key or "date",
+                             "newest_first": newest_first},
+                 "coverage": coverage}, res)
 
 
 @mcp.tool()

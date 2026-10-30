@@ -39,6 +39,16 @@ CASES = [
     ("market_overview", {}),
     ("news", {"limit": 3}),
     ("insider_trades", {"limit": 3}),
+    # --- insider_trades: server-side filtering (2026-10-30). The old client-side filter
+    # returned 0 rows for NVDA because it only scanned the 200-row global page.
+    ("insider_trades", {"ticker": "NVDA", "limit": 5}),
+    ("insider_trades", {"ticker": "NVDA", "transaction": "buy", "limit": 5}),
+    ("insider_trades", {"ticker": "BRK.B", "limit": 3}),
+    ("insider_trades", {"min_value": 5_000_000, "limit": 3}),
+    ("insider_trades", {"owner_type": "10%_owner", "limit": 3}),
+    ("insider_trades", {"sort": "value", "limit": 3}),
+    ("insider_trades", {"ticker": "AAPL,MSFT"}),            # harus MENOLAK (1 ticker/call)
+    ("insider_trades", {"transaction": "buyback"}),         # harus MENOLAK (nilai tak dikenal)
     ("economic_calendar", {"min_importance": 1}),
     ("screener_signal", {"signal": "topgainers", "limit": 5}),      # harus LOLOS (URL allow-list, v=340)
     ("custom_screener", {"filters": "idx_sp500", "limit": 5}),      # harus MENOLAK (butuh opt-in)
@@ -53,6 +63,41 @@ CASES = [
     ("dividends_calendar", {}),
     ("group_performance", {"kind": "sector"}),
 ]
+
+
+def expects_reject(name: str, args: dict) -> str:
+    """Kasus yang JUSTRU HARUS ditolak. Mengembalikan substring error yang diharapkan, atau ""."""
+    if name == "custom_screener" and not args.get("allow_noncompliant"):
+        return "robots"
+    if name == "insider_trades":
+        if "," in str(args.get("ticker", "")):
+            return "one ticker per call"
+        tx = str(args.get("transaction", "")).strip().lower()
+        if tx and tx not in ("all", "buy", "sale", "option"):
+            return "unknown transaction"
+    return ""
+
+
+def invariant_failure(name: str, args: dict, d: dict) -> str:
+    """Kontrak yang harus dipegang hasil, bukan cuma ok=True. Kembalikan pesan bila dilanggar."""
+    if name != "insider_trades" or d.get("ok") is not True:
+        return ""
+    rows = d.get("rows") or []
+    want_t = str(args.get("ticker", "")).strip().upper().replace(".", "-")
+    if want_t and any(r.get("ticker") != want_t for r in rows):
+        return f"row ticker != {want_t}"
+    if want_t in ("NVDA", "AAPL", "BRK-B") and not rows:
+        return f"{want_t} returned 0 rows — server-side filter regressed"
+    if args.get("transaction") == "buy" and any("buy" not in r.get("transaction", "").lower() for r in rows):
+        return "non-buy row in buy result"
+    mv = int(args.get("min_value") or 0)
+    if mv and any((r.get("value_usd_num") or 0) < mv for r in rows):
+        return f"row below min_value {mv}"
+    if args.get("owner_type") == "10%_owner" and any(r.get("relationship") != "10% Owner" for r in rows):
+        return "non-10%-owner row"
+    if "coverage" not in d:
+        return "coverage block missing"
+    return ""
 
 
 async def main():
@@ -75,7 +120,10 @@ async def main():
                 if "event_count" in d:
                     detail = f"events={d['event_count']}"
                 elif "rows" in d:
+                    cov = d.get("coverage") or {}
                     detail = f"rows={len(d['rows'])}"
+                    if cov:
+                        detail += f" page={cov.get('page_rows_total')} match={cov.get('rows_matching_filters')}"
                 elif "headlines" in d:
                     detail = f"headlines={len(d['headlines'])}"
                 elif name == "quote":
@@ -87,15 +135,20 @@ async def main():
                 elif name == "robots_policy":
                     detail = f"robots_url={'ada' if d.get('robots_url') else '-'}"
                 if ok is True:
-                    lolos += 1
-                    print(f"  {name:<20} ok=True  {detail}")
+                    bad = invariant_failure(name, args, d)
+                    if bad:
+                        gagal += 1
+                        print(f"  {name:<20} ok=True  {detail} <- PELANGGARAN KONTRAK: {bad}")
+                    else:
+                        lolos += 1
+                        print(f"  {name:<20} ok=True  {detail}")
                 elif ok is False:
-                    # Hanya penolakan custom_screener TANPA opt-in yang benar; sinyal allow-list
-                    # sekarang harus lolos, jadi ok=False di sana adalah regresi.
-                    err = str(d.get("error", ""))[:60]
-                    benar = (name == "custom_screener" and "robots" in err.lower()
-                             and not args.get("allow_noncompliant"))
-                    print(f"  {name:<20} ok=False {err} {'<- memang seharusnya begitu' if benar else '<- PERIKSA'}")
+                    # Penolakan yang BENAR didefinisikan di expects_reject(), bukan dengan
+                    # menerima semua ok=False (itu akan menyembunyikan regresi baru).
+                    err = str(d.get("error", ""))
+                    want = expects_reject(name, args)
+                    benar = bool(want) and want.lower() in err.lower()
+                    print(f"  {name:<20} ok=False {err[:60]} {'<- memang seharusnya begitu' if benar else '<- PERIKSA'}")
                     if benar:
                         netral += 1
                     else:
