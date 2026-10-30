@@ -44,6 +44,14 @@ CASES = [
     ("custom_screener", {"filters": "idx_sp500", "limit": 5}),      # harus MENOLAK (butuh opt-in)
     ("custom_screener", {"filters": "industry_shellcompanies", "limit": 5,
                          "allow_noncompliant": True}),              # harus LOLOS dengan opt-in
+    # --- 6 tool yang dulu tidak pernah diuji regresi (ditemukan 2026-10-30 oleh catatan eko) ---
+    ("quote_batch", {"tickers": ["NVDA"], "preset": "valuation"}),  # Market Cap wajib ada
+    ("screener_filters", {"search": "shell", "limit": 5}),          # katalog, tidak boleh menolak diri sendiri
+    ("screener_all", {"filters": "industry_shellcompanies", "max_pages": 2,
+                      "allow_noncompliant": True}),                 # pagination harus berhenti
+    ("earnings_calendar", {}),
+    ("dividends_calendar", {}),
+    ("group_performance", {"kind": "sector"}),
 ]
 
 
