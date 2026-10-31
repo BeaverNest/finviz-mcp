@@ -50,6 +50,17 @@ CASES = [
     ("insider_trades", {"ticker": "AAPL,MSFT"}),            # harus MENOLAK (1 ticker/call)
     ("insider_trades", {"transaction": "buyback"}),         # harus MENOLAK (nilai tak dikenal)
     ("economic_calendar", {"min_importance": 1}),
+    # --- kalender: `dateTo` diabaikan Finviz (2026-10-31). Sabtu sebagai tanggal awal dulu
+    # mengembalikan 0 baris; ini yang harus tetap benar setelah perbaikan.
+    ("economic_calendar", {"date_from": "2026-10-31", "date_to": "2026-11-07",
+                           "min_importance": 2}),                     # weekend-start wajib berisi
+    ("economic_calendar", {"date_from": "2026-11-04", "date_to": "2026-11-04",
+                           "min_importance": 2}),                     # 1 hari di tengah minggu
+    ("earnings_calendar", {"date_from": "2026-10-31", "date_to": "2026-11-07",
+                           "limit": 10}),                             # weekend-start wajib berisi
+    ("earnings_calendar", {"date_from": "2026-11-02", "date_to": "2026-11-06",
+                           "ticker": "NVO", "max_pages_per_day": 3}),  # ticker ada di halaman 2
+    ("dividends_calendar", {"date_from": "2026-10-31", "limit": 5}),   # weekend-start wajib berisi
     ("screener_signal", {"signal": "topgainers", "limit": 5}),      # harus LOLOS (URL allow-list, v=340)
     ("custom_screener", {"filters": "idx_sp500", "limit": 5}),      # harus MENOLAK (butuh opt-in)
     ("custom_screener", {"filters": "industry_shellcompanies", "limit": 5,
@@ -117,6 +128,31 @@ def invariant_failure(name: str, args: dict, d: dict) -> str:
                 return "is_estimate=true but an actual is present"
         if "next_earnings_date" not in d:
             return "next_earnings_date missing"
+        return ""
+    if name in ("earnings_calendar", "dividends_calendar", "economic_calendar"):
+        # Invariant yang menangkap bug 2026-10-31: kalender "sukses" dengan 0 baris untuk
+        # jendela yang sebenarnya berisi. Weekend-start + `dateTo` yang diabaikan Finviz
+        # menghasilkan ok=True dan rows=[] — persis kegagalan yang tidak terlihat.
+        if d.get("ok") is not True:
+            return ""
+        wants_rows = args.get("date_from") in ("2026-10-31", "2026-11-02", "2026-11-04")
+        if wants_rows and not (d.get("rows") or d.get("events")):
+            return "empty result for a window that must contain data"
+        if name == "economic_calendar":
+            for ev in d.get("events") or []:
+                day = str(ev.get("date") or "")[:10]
+                if day and (day < args.get("date_from", "") or
+                            day > (args.get("date_to") or d.get("date_to", ""))):
+                    return f"event outside window: {day}"
+            return ""
+        for row in d.get("rows") or []:
+            day = str(row.get("calendar_day") or row.get("ex_date") or "")[:10]
+            if day and (day < (args.get("date_from") or d.get("date_from", "")) or
+                        day > (args.get("date_to") or d.get("date_to", ""))):
+                return f"row outside window: {day}"
+        cov = d.get("counts") or {}
+        if "days_scanned" in cov and cov["days_scanned"] == 0:
+            return "no weekday scanned"
         return ""
     if name != "insider_trades" or d.get("ok") is not True:
         return ""

@@ -1677,33 +1677,78 @@ def economic_calendar(date_from: str = "", date_to: str = "", min_importance: in
             end = (date.fromisoformat(start) + timedelta(days=7)).isoformat()
         except ValueError:
             end = start
+    # Diverifikasi 2026-10-31: `/api/calendar/economic` mengabaikan `dateTo` dan SELALU
+    # mengembalikan 7 hari yang BERAKHIR pada Jumat di minggu `dateFrom` (minta 10..14 Nov →
+    # dapat 6..13 Nov; minta 30 Okt → dapat 23..30 Okt). Dulu filter window lokal membuang
+    # semuanya sehingga `event_count` bisa 0 padahal data ada. Sekarang tiap minggu yang
+    # ditanyakan diambil lewat Jumat-nya lalu digabung, dan sisa di luar rentang dibuang.
+    def _friday_of(d: date) -> date:
+        return d + timedelta(days=(4 - d.weekday()) % 7) if d.weekday() <= 4 \
+            else d - timedelta(days=d.weekday() - 4)
+
+    weeks = 1
+    fridays: list[str] = []
     try:
-        res = _get("/api/calendar/economic", {"dateFrom": start, "dateTo": end}, ttl=300, expect_json=True)
+        asked_from, asked_to = date.fromisoformat(start), date.fromisoformat(end)
+        if asked_to < asked_from:
+            asked_from, asked_to = asked_to, asked_from
+        first = _friday_of(asked_from)
+        last = _friday_of(asked_to)
+        d = first
+        while d <= last and len(fridays) < 26:
+            fridays.append(d.isoformat())
+            d += timedelta(days=7)
+        weeks = max(1, len(fridays))
+    except ValueError:
+        fridays = []
+        weeks = 0
+    try:
+        if fridays:
+            raw_events: list[Any] = []
+            res: dict[str, Any] = {}
+            for f in fridays:
+                res = _get("/api/calendar/economic",
+                           {"dateFrom": f, "dateTo": f}, ttl=300, expect_json=True)
+                payload = res["payload"]
+                batch = payload if isinstance(payload, list) else payload.get("events", [])
+                raw_events.extend(batch)
+        else:
+            res = _get("/api/calendar/economic", {"dateFrom": start, "dateTo": end},
+                       ttl=300, expect_json=True)
+            payload = res["payload"]
+            raw_events = payload if isinstance(payload, list) else payload.get("events", [])
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
     raw = res["payload"]
     events = []
     dropped_outside = 0
-    for ev in raw if isinstance(raw, list) else raw.get("events", []):
+    seen: set[tuple[str, str, str]] = set()
+    for ev in raw_events if fridays else (raw if isinstance(raw, list) else raw.get("events", [])):
         if int(ev.get("importance") or 0) < int(min_importance or 0):
             continue
         # Finviz's calendar endpoint returns a WIDER set than requested (verified 2026-10-21:
         # asked 2026-10-22..29, got 31 of 52 events dated before 2026-10-22). Report a window
         # and return events outside it is a lie, so enforce the window here and say how many
-        # rows were dropped.
+        # rows were dropped. Minggu yang tumpang tindih juga menghasilkan duplikat → dibuang.
         ev_day = str(ev.get("date") or "")[:10]
         if ev_day and (ev_day < start or ev_day > end):
             dropped_outside += 1
             continue
+        key = (ev_day, str(ev.get("event") or ""), str(ev.get("calendarId") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
         events.append({
             "date": ev.get("date"), "reference": ev.get("reference"),
             "event": ev.get("event"), "category": ev.get("category"),
             "importance": ev.get("importance"), "actual": ev.get("actual"),
             "forecast": ev.get("forecast"), "previous": ev.get("previous"),
         })
+    events.sort(key=lambda e: str(e.get("date") or ""))
     return _out({"ok": True, "date_from": start, "date_to": end, "events": events,
                  "event_count": len(events),
                  "window_enforced": True,
+                 "weeks_fetched": weeks,
                  "events_dropped_outside_window": dropped_outside}, res)
 
 
@@ -1729,45 +1774,89 @@ def _calendar_window(date_from: str, date_to: str, days: int = 7) -> tuple[str, 
     return start, end
 
 
-def _calendar_items(res: dict[str, Any], limit: int, page: int) -> tuple[list[dict], dict]:
+_DAY_FIELD_PRIORITY = ("earningsDate", "exdate", "date")
+
+
+def _row_day(it: dict[str, Any]) -> str:
+    for k in _DAY_FIELD_PRIORITY:
+        v = it.get(k)
+        if v:
+            return str(v)[:10]
+    return ""
+
+
+def _weekdays(start: str, end: str, cap: int = 366) -> list[str]:
+    """Hari Senin–Jumat di dalam rentang (Sabtu/Minggu tidak punya sesi)."""
+    try:
+        d0, d1 = date.fromisoformat(start), date.fromisoformat(end)
+    except ValueError:
+        return []
+    if d1 < d0:
+        d0, d1 = d1, d0
+    days: list[str] = []
+    d = d0
+    while d <= d1 and len(days) < cap:
+        if d.weekday() < 5:
+            days.append(d.isoformat())
+        d += timedelta(days=1)
+    return days
+
+
+def _calendar_page(path: str, day: str, page: int,
+                   ttl: int = 300) -> tuple[list[dict], dict, dict]:
+    params: dict[str, Any] = {"dateFrom": day, "dateTo": day}
+    if page > 1:
+        params["page"] = page
+    res = _get(path, params, ttl=ttl, expect_json=True)
     raw = res["payload"] if isinstance(res["payload"], dict) else {}
-    items = raw.get("items") or []
+    rows = [it for it in (raw.get("items") or []) if _row_day(it) in ("", day)]
     meta = {"page": raw.get("page"), "page_size": raw.get("pageSize"),
-            "total_items": raw.get("totalItemsCount"), "total_pages": raw.get("totalPages"),
-            "requested_page": page, "returned": min(len(items), limit),
-            "page_size_is_fixed": True}
-    return items[: max(0, int(limit or 50))], meta
+            "total_items": raw.get("totalItemsCount"), "total_pages": raw.get("totalPages")}
+    return rows, meta, res
 
 
-def _calendar_collect(path: str, base: dict[str, Any], page: int, limit: int,
-                      max_pages: int = 3) -> tuple[list[dict], dict, dict]:
-    """Ambil beberapa halaman sampai cukup bahan untuk difilter.
+def _calendar_union(path: str, start: str, end: str, page: int = 1, limit: int = 25,
+                    max_pages: int = 2, cap_days: int = 14
+                    ) -> tuple[list[dict], dict, dict]:
+    """Gabungkan beberapa HARI terpisah, jangan serahkan rentang ke Finviz.
 
-    Filter (ticker/yield/market cap) dijalankan DI SISI KITA, sedangkan `pageSize` Finviz tetap
-    50 dan tidak bisa diubah — jadi satu halaman bisa tidak memuat baris yang lolos filter.
-    Ditemukan oleh Eko saat memakai tool ini (laporan: "filter applied per page").
-    Maksimum `max_pages` halaman supaya tidak membanjiri situs.
+    Diverifikasi 2026-10-31: `/api/calendar/earnings?dateFrom=2026-11-02&dateTo=2026-11-06`
+    mengembalikan baris yang SEMUANYA bertanggal 2026-11-02 — `dateTo` diabaikan, hanya hari
+    pertama yang dipakai. Lebih buruk: bila `dateFrom` jatuh di Sabtu/Minggu responsnya kosong
+    (0 baris), jadi tool yang default-nya "hari ini s/d +7" buta setiap akhir pekan.
+    Karena itu tiap hari ditanyakan sendiri di sini dan coverage dilaporkan apa adanya,
+    bukan diklaim lengkap.
     """
-    p = max(1, int(page or 1))
-    raw_needed = max(50, int(limit or 25) * 3)
+    all_days = _weekdays(start, end, cap=366)
+    days = all_days[: max(1, int(cap_days or 14))]
+    want = max(1, int(limit or 25))
+    p_start = max(1, int(page or 1))
+    per_day = max(1, int(max_pages or 1))
     collected: list[dict] = []
-    counts: dict = {}
-    res: dict = {}
     pages_fetched = 0
-    while pages_fetched < max_pages and len(collected) < raw_needed:
-        params = dict(base)
-        if p > 1:
-            params["page"] = p
-        res = _get(path, params, ttl=300, expect_json=True)
-        items, counts = _calendar_items(res, 50, p)
-        collected.extend(items)
-        pages_fetched += 1
-        total_pages = int(counts.get("total_pages") or 1)
-        if p >= total_pages:
-            break
-        p += 1
-    counts["pages_fetched"] = pages_fetched
-    counts["raw_items_considered"] = len(collected)
+    available = 0
+    res: dict = {}
+    for day in days:
+        for p in range(p_start, p_start + per_day):
+            rows, meta, res = _calendar_page(path, day, p)
+            pages_fetched += 1
+            if p == p_start:
+                available += int(meta.get("total_items") or 0)
+            collected.extend({**it, "calendar_day": day} for it in rows)
+            if p >= int(meta.get("total_pages") or 1):
+                break
+    counts = {
+        "days_requested": len(all_days), "days_scanned": len(days),
+        "pages_fetched": pages_fetched, "rows_considered": len(collected),
+        "rows_available_in_scanned_days": available,
+        "pages_per_day_cap": per_day, "page_size_is_fixed": True,
+        "coverage_complete": len(days) == len(all_days),
+        # Hari ramai (mis. 4 Nov: 388 emiten = 8 halaman) bisa melebihi `max_pages_per_day`.
+        # Naikkan nilainya kalau mencari ticker kecil; angka ini yang memberi tahu bahwa
+        # "tidak ditemukan" mungkin berarti "tidak terpindai", bukan "tidak ada".
+        "rows_truncated_by_page_cap": max(0, available - len(collected)),
+        "truncation_is_possible": available > len(collected),
+    }
     return collected, counts, res
 
 
@@ -1779,6 +1868,7 @@ def earnings_calendar(
     min_market_cap: float = 0.0,
     limit: int = 25,
     page: int = 1,
+    max_pages_per_day: int = 2,
 ) -> str:
     """Jadwal rilis laba (earnings) — API JSON internal Finviz, robots-compliant, tanpa kunci.
 
@@ -1790,15 +1880,17 @@ def earnings_calendar(
         ticker: saring satu emiten (mis. "AAPL"); kosong = semua.
         min_market_cap: saring market cap minimum (satuan Finviz: juta USD).
         limit: maksimum baris dikembalikan (maksimum server 50 per halaman).
-        page: halaman (1-based). `pageSize` TIDAK bisa diubah — selalu 50.
+        page: halaman awal per hari (1-based). `pageSize` TIDAK bisa diubah — selalu 50.
+        max_pages_per_day: halaman per hari yang diambil (default 2 = 100 baris/hari).
 
     Returns:
-        JSON: items + penghitung halaman + provenance/compliance.
+        JSON: rows + counts (hari dipindai, baris tersedia, coverage_complete).
     """
     start, end = _calendar_window(date_from, date_to)
     try:
-        items, counts, res = _calendar_collect("/api/calendar/earnings", {"dateFrom": start, "dateTo": end},
-                                               int(page or 1), int(limit or 25))
+        items, counts, res = _calendar_union("/api/calendar/earnings", start, end,
+                                             int(page or 1), int(limit or 25),
+                                             int(max_pages_per_day or 2))
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
     want = (ticker or "").strip().upper()
@@ -1810,6 +1902,7 @@ def earnings_calendar(
         if mind and float(it.get("marketCap") or 0) < mind:
             continue
         rows.append({
+            "calendar_day": it.get("calendar_day"),
             "earnings_date": it.get("earningsDate"),
             "date_is_estimate": it.get("isEarningDateEstimate"),
             "ticker": it.get("ticker"), "company": it.get("company"),
@@ -1825,9 +1918,11 @@ def earnings_calendar(
     rows = rows[: max(1, int(limit or 25))]
     return _out({"ok": True, "date_from": start, "date_to": end, "rows": rows,
                  "row_count": len(rows), "counts": counts,
-                 "notes": ["pageSize Finviz tetap 50 dan tidak bisa diubah; tool ini otomatis "
-                           "menggabungkan sampai 3 halaman agar filter punya cukup bahan "
-                           "(lihat counts.pages_fetched / raw_items_considered).",
+                 "notes": ["Rentang TIDAK diteruskan ke Finviz: `dateTo` diabaikan server mereka dan "
+                           "hari pertama yang dipakai, jadi setiap hari kerja ditanyakan terpisah.",
+                           "Hari Sabtu/Minggu tidak dipindai (tanpa sesi) — ini juga yang tadinya "
+                           "membuat window default kosong tiap akhir pekan.",
+                           "date_is_estimate=true berarti tanggalnya belum dikonfirmasi emiten.",
                            "eps_actual kosong berarti emiten belum melapor pada saat pengambilan."]}, res)
 
 
@@ -1839,6 +1934,7 @@ def dividends_calendar(
     min_yield: float = 0.0,
     limit: int = 25,
     page: int = 1,
+    max_pages_per_day: int = 2,
 ) -> str:
     """Jadwal ex-dividend — API JSON internal Finviz, robots-compliant, tanpa kunci.
 
@@ -1847,12 +1943,14 @@ def dividends_calendar(
         ticker: saring satu emiten; kosong = semua.
         min_yield: saring dividend yield minimum (persen, mis. 5 untuk >= 5%).
         limit: maksimum baris (halaman Finviz tetap 50).
-        page: halaman (1-based).
+        page: halaman awal per hari (1-based).
+        max_pages_per_day: halaman per hari yang diambil (default 2 = 100 baris/hari).
     """
     start, end = _calendar_window(date_from, date_to)
     try:
-        items, counts, res = _calendar_collect("/api/calendar/dividends", {"dateFrom": start, "dateTo": end},
-                                               int(page or 1), int(limit or 25))
+        items, counts, res = _calendar_union("/api/calendar/dividends", start, end,
+                                             int(page or 1), int(limit or 25),
+                                             int(max_pages_per_day or 2))
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2)
     want = (ticker or "").strip().upper()

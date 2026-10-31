@@ -56,6 +56,29 @@ on a list of tickers you already have, `quote_batch` is still cheaper and fully 
 | `screener_filters` | `/screener` | **opt-in** | catalogue of 23 groups / 828 valid `f=` values, searchable |
 | `screener_all` | `/screener` | **opt-in** | paginated fetch, `max_pages` budget (default 3, cap 50) |
 
+### Calendars: `dateTo` is a lie, weekdays are scanned one by one
+
+Verified 2026-10-31 against all three `/api/calendar/*` endpoints:
+
+| Request | Response |
+|---|---|
+| `earnings?dateFrom=2026-11-02&dateTo=2026-11-06` | every row dated **2026-11-02** (`dateTo` ignored) |
+| `earnings?dateFrom=2026-10-31` (Saturday) | **0 rows** (4 Nov alone holds 388 names across 8 pages) |
+| `economic?dateFrom=2026-11-10&dateTo=2026-11-14` | 6..13 Nov — a fixed 7-day window **ending on that week's Friday** |
+
+So `earnings_calendar` / `dividends_calendar` ask **one weekday at a time** and
+`economic_calendar` walks week-by-week via each week's Friday, then filters to the window
+requested. Consequences worth knowing:
+
+- A ticker can sit on page 2+ of a busy day (NVO on 2026-11-04 is page 2 of 8). Default is
+  2 pages/day ≈ 100 rows; raise `max_pages_per_day` and read
+  `counts.rows_truncated_by_page_cap` — `rows: []` with `truncation_is_possible: true` means
+  **not scanned**, not **not scheduled**.
+- `counts.coverage_complete` says whether every weekday in the range was scanned.
+- Saturday/Sunday are never scanned; that is also why the old default window returned nothing
+  every weekend.
+- `economic_calendar` reports `weeks_fetched` (1..26) so the shape of the walk is visible.
+
 ### Reading screener rows without a 1e6 error
 
 Free-tier finviz reports `marketCap` in **millions of USD** — the raw float is
